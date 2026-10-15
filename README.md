@@ -9,7 +9,52 @@ from the existing LinkWatch `tools/dependency_evidence.py`; that checkout and it
 changes are preserved. No standalone Enigma or DepExit implementation was found in
 the inspected Documents workspace. The original MIT notice is retained in LICENSE.
 
-## Actual result, 15 October 2026
+## Latest integration check
+
+Presentation update: **26 Enigma tests pass**. Every run now generates an offline
+`reports/dependency_exit_capsule.html` presentation, plus JSON and Markdown. The
+console and both human-facing reports separate workflow completion, repository
+baseline, model inference, approval, changes, post-change checks, Hermes discovery
+and Hermes agent execution. A completed review is not a repository PASS.
+
+Open the presentation in PowerShell with:
+
+```powershell
+Start-Process .\reports\dependency_exit_capsule.html
+```
+
+To display the existing recorded run and regenerate its views without running
+tests, inference or edits:
+
+```powershell
+python -m enigma show reports/dependency_exit_capsule.json --output reports
+python -m enigma validate reports/dependency_exit_capsule.json --markdown reports/dependency_exit_capsule.md --html reports/dependency_exit_capsule.html
+```
+
+`show` exits 0 when reading/rendering succeeds, even if the saved repository result
+is FAIL. `run` retains its existing aggregation and exit codes. These presentation
+states are derived from the canonical report; they do not replace recorded outcomes.
+The HTML uses no external assets or JavaScript, escapes all dynamic content, and
+includes command logs, the model recommendation, the separate deterministic patch,
+limitations and links to canonical data. See DEPENDENCY_EXPLANATION.md for the
+observed LinkWatch dependency failure and Enigma's editing boundary.
+
+After local setup, `gemma4:latest` produced an actual validated recommendation:
+**Model PASS**, with 21 Enigma tests passing. Both capsules were regenerated from the
+live run. Overall remains FAIL because LinkWatch still has its pre-existing test failure.
+The Markdown capsule now presents the model's suggested action, rationale, risks,
+future verification steps and cited evidence in a dedicated Gemma recommendation
+section. The CLI prints its suggested action too. The text comes from inference;
+only the schema and presentation are predefined. Input evidence and prompt/response
+hashes are recorded for traceability, not as a cryptographic attestation of inference.
+
+Hermes discovery succeeds, but skill invocation remains NOT_VERIFIED. Direct Python
+CLI runs are orchestrated by Enigma, not Hermes. A Hermes-driven demonstration must
+show Hermes loading the skill, invoking Enigma, reading the report and presenting
+the recommendation/approval request. Listing an installed skill is not proof of that.
+The table below records the initial delivery, before the user's local model setup.
+
+## Initial delivery result, 15 October 2026
 
 | Item | Evidence/status |
 |---|---|
@@ -25,9 +70,17 @@ the inspected Documents workspace. The original MIT notice is retained in LICENS
 
 **The real capsule's overall result is FAIL**, because a requested repository check
 failed. This does not mean the Enigma test suite failed. No real model recommendation
-was generated, and this project is not claimed to satisfy event submission requirements.
+was generated at initial delivery; later live inference is recorded above. This
+project is not claimed to satisfy event submission requirements.
 
 ## Run without installing
+
+For slow local inference or first model loading, add `--model-timeout 300`.
+The default is 180 seconds; allowed values are 1–900 seconds. The selected timeout
+is recorded in new capsules. This replaces the original 20-second inference timeout.
+The adapter requests schema-constrained JSON with thinking disabled and a 1,200-token
+output limit. Empty or truncated final responses remain BLOCKED; reasoning text is
+never treated as the recommendation. Regression coverage now totals 21 passing tests.
 
 Use Python 3.12 or 3.13. Enigma itself uses only the standard library. Its test suite
 uses unittest; one end-to-end fixture also invokes an already-installed pytest.

@@ -1,5 +1,10 @@
 # Implementation handoff — 15 October 2026
 
+Update after local model setup: the corrected adapter was tested against the installed
+`gemma4:latest` and returned Model PASS with a validated real recommendation. The latest
+capsules contain that run. All 20 current Enigma tests pass. Overall remains FAIL due
+to LinkWatch's existing test failure. The remaining sections record the initial handoff.
+
 ## Delivered and verified
 
 A runnable standard-library Python CLI implements inspection, evidence-backed finding,
