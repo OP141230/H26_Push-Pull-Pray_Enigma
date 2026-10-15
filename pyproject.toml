@@ -1,38 +1,36 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
-name = "enigma-maintainer"
+name = "enigma"
 version = "0.1.0"
-description = "Evidence-driven repository maintenance agent skill"
+description = "Evidence-driven repository maintenance agent skill — Hacktoberfest 2026 Track 2"
 readme = "README.md"
-license = {text = "MIT"}
-requires-python = ">=3.12,<3.14"
-authors = [{name = "Push-Pull-Pray"}]
-keywords = ["maintenance", "agent", "dependency", "hacktoberfest"]
-classifiers = [
-    "Development Status :: 3 - Alpha",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-    "Topic :: Software Development :: Quality Assurance",
-]
+
+license = { text = "MIT" }
+requires-python = ">=3.12"
 dependencies = [
-    "jsonschema>=4.20.0",
-    "packaging>=23.0",
+    "click>=8.1,<9",
+    "jsonschema>=4.21,<5",
+    "requests>=2.32,<3",
+    "tomli>=2.0,<3; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.4.0", "pytest-cov>=4.1.0"]
-model = ["llama-cpp-python>=0.2.0"]
+dev = [
+    "pytest>=8,<9",
+    "pytest-cov>=5,<6",
+]
 
 [project.scripts]
-enigma = "enigma.cli:main"
+enigma = "enigma.cli:cli"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["."]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["enigma*"]
+[tool.hatch.build.targets.wheel]
+packages = ["enigma"]

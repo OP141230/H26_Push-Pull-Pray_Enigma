@@ -1,310 +1,274 @@
-"""Stage A: Deterministic repository inspection."""
+"""Stage A: Deterministic inspection of a target Python repository.
+
+Reads pyproject.toml, requirements*.txt, setup.cfg, .python-version.
+Returns structured InspectionResult with file paths, line numbers, evidence.
+Never raises — all errors are captured in the result.
+"""
+
 from __future__ import annotations
 
-import configparser
 import os
-import re
 import subprocess
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Optional
 
-from enigma.models import EvidenceRef, Finding, Severity, Status
+# tomllib is stdlib in Python 3.11+; fall back to tomli for 3.10
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    try:
+        import tomllib
+    except ImportError:
+        try:
+            import tomli as tomllib  # type: ignore[no-reuse-import]
+        except ImportError:
+            tomllib = None  # type: ignore[assignment]
 
-# Directories to always skip
+# Directories to skip during scanning
 SKIP_DIRS = {
-    ".git", "__pycache__", ".venv", "venv", "env",
-    "node_modules", ".tox", ".mypy_cache", ".pytest_cache",
-    "dist", "build", "*.egg-info", ".eggs",
+    ".git", "__pycache__", ".venv", "venv", "env", ".env",
+    "node_modules", "dist", "build", ".tox", ".mypy_cache",
+    "site-packages", ".eggs",
 }
 
-MAX_FILE_SIZE = 512 * 1024  # 512 KB
+MAX_FILE_BYTES = 256 * 1024  # 256 KB cap per file
 
 
-def should_skip_dir(dirname: str) -> bool:
-    """Check if a directory should be skipped."""
-    return dirname in SKIP_DIRS or dirname.endswith(".egg-info")
+@dataclass
+class EvidenceRef:
+    """A traceable reference to a specific location in a file."""
+    file_path: str
+    line_number: Optional[int]
+    excerpt: str
+    status: str = "OBSERVED"
 
 
-def read_file_safe(path: Path, max_size: int = MAX_FILE_SIZE) -> str | None:
-    """Read a file safely, respecting size limits."""
+@dataclass
+class InspectionResult:
+    """All deterministically observed facts about the target repository."""
+    repo_path: str
+    repo_commit: Optional[str] = None
+    repo_branch: Optional[str] = None
+    python_requires: Optional[str] = None
+    python_version_file: Optional[str] = None
+    pyproject_path: Optional[str] = None
+    requirements_path: Optional[str] = None
+    requirements_dev_path: Optional[str] = None
+    classifiers: list[str] = field(default_factory=list)
+    pyproject_deps: dict[str, str] = field(default_factory=dict)
+    requirements_deps: dict[str, str] = field(default_factory=dict)
+    requirements_dev_deps: dict[str, str] = field(default_factory=dict)
+    evidence: list[EvidenceRef] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    unsupported_formats: list[str] = field(default_factory=list)
+
+
+def _git_info(repo_path: Path) -> tuple[Optional[str], Optional[str]]:
+    """Return (commit_hash, branch) or (None, None) on failure."""
     try:
-        if not path.is_file():
-            return None
-        if path.stat().st_size > max_size:
-            return None
+        commit = subprocess.check_output(
+            ["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL, timeout=10,
+        ).decode().strip()
+        branch = subprocess.check_output(
+            ["git", "-C", str(repo_path), "rev-parse", "--abbrev-ref", "HEAD"],
+            stderr=subprocess.DEVNULL, timeout=10,
+        ).decode().strip()
+        return commit, branch
+    except Exception:
+        return None, None
+
+
+def _read_safe(path: Path) -> Optional[str]:
+    """Read a text file up to MAX_FILE_BYTES. Return None on error."""
+    try:
+        size = path.stat().st_size
+        if size > MAX_FILE_BYTES:
+            return None  # too large
         return path.read_text(encoding="utf-8", errors="replace")
-    except (OSError, PermissionError):
+    except Exception:
         return None
 
 
-def find_manifest_files(repo_path: Path) -> dict[str, Path]:
-    """Find Python project manifest files."""
-    manifests: dict[str, Path] = {}
-    candidates = {
-        "pyproject.toml": "pyproject.toml",
-        "setup.py": "setup.py",
-        "setup.cfg": "setup.cfg",
-        "requirements.txt": "requirements.txt",
-        "requirements-dev.txt": "requirements-dev.txt",
-        "Pipfile": "Pipfile",
-    }
-    for label, filename in candidates.items():
-        fpath = repo_path / filename
-        if fpath.is_file():
-            manifests[label] = fpath
-    return manifests
+def _parse_pyproject(result: InspectionResult, path: Path) -> None:
+    """Parse pyproject.toml and populate result fields."""
+    if tomllib is None:
+        result.unsupported_formats.append(f"{path}: tomllib/tomli not available")
+        return
+    text = _read_safe(path)
+    if text is None:
+        result.errors.append(f"Cannot read {path}")
+        return
+    try:
+        data = tomllib.loads(text)
+    except Exception as exc:
+        result.errors.append(f"Malformed TOML in {path}: {exc}")
+        return
+
+    result.pyproject_path = str(path)
+    project = data.get("project", {})
+
+    # python_requires
+    py_req = project.get("requires-python")
+    if py_req:
+        result.python_requires = py_req
+        # find line number
+        for i, line in enumerate(text.splitlines(), 1):
+            if "requires-python" in line:
+                result.evidence.append(EvidenceRef(
+                    file_path=str(path),
+                    line_number=i,
+                    excerpt=line.strip(),
+                    status="OBSERVED",
+                ))
+                break
+
+    # classifiers
+    classifiers = project.get("classifiers", [])
+    result.classifiers = classifiers
+    for i, line in enumerate(text.splitlines(), 1):
+        if "Programming Language :: Python ::" in line:
+            result.evidence.append(EvidenceRef(
+                file_path=str(path),
+                line_number=i,
+                excerpt=line.strip(),
+                status="OBSERVED",
+            ))
+
+    # dependencies
+    deps_raw = project.get("dependencies", [])
+    for dep in deps_raw:
+        name, version = _split_dep(dep)
+        result.pyproject_deps[name] = version
+    # capture pydantic specifically
+    for i, line in enumerate(text.splitlines(), 1):
+        if "pydantic" in line.lower():
+            result.evidence.append(EvidenceRef(
+                file_path=str(path),
+                line_number=i,
+                excerpt=line.strip(),
+                status="OBSERVED",
+            ))
 
 
-def parse_requirements_txt(content: str) -> list[str]:
-    """Parse a requirements.txt file."""
-    deps = []
-    for line in content.splitlines():
+def _parse_requirements(path: Path) -> dict[str, str]:
+    """Parse a requirements.txt-style file. Returns {name: version_spec}."""
+    deps: dict[str, str] = {}
+    text = _read_safe(path)
+    if text is None:
+        return deps
+    for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or line.startswith("-"):
             continue
-        # Strip version specifiers for name extraction
-        name = re.split(r"[><=!~;@\[]", line)[0].strip()
-        if name:
-            deps.append(name)
+        name, version = _split_dep(line)
+        deps[name] = version
     return deps
 
 
-def parse_setup_cfg_deps(content: str) -> list[str]:
-    """Parse install_requires from setup.cfg."""
-    config = configparser.ConfigParser()
-    try:
-        config.read_string(content)
-    except configparser.Error:
-        return []
-    deps = []
-    if config.has_option("options", "install_requires"):
-        raw = config.get("options", "install_requires")
-        for line in raw.splitlines():
-            line = line.strip()
-            if line:
-                name = re.split(r"[><=!~;@\[]", line)[0].strip()
-                if name:
-                    deps.append(name)
-    return deps
+def _split_dep(dep: str) -> tuple[str, str]:
+    """Split 'requests==2.31.0' into ('requests', '==2.31.0')."""
+    import re
+    m = re.match(r"^([A-Za-z0-9_.\-]+)\s*([><=!~].*)?$", dep.strip())
+    if m:
+        return m.group(1).lower(), (m.group(2) or "").strip()
+    return dep.lower(), ""
 
 
-def parse_pyproject_deps(content: str) -> list[str]:
-    """Parse dependencies from pyproject.toml (basic TOML parsing)."""
-    deps = []
-    in_deps = False
-    for line in content.splitlines():
-        stripped = line.strip()
-        if stripped == 'dependencies = [':
-            in_deps = True
-            continue
-        if in_deps:
-            if stripped == ']':
-                break
-            # Extract package name from quoted string
-            match = re.match(r'["\']([a-zA-Z0-9_-]+)', stripped)
-            if match:
-                deps.append(match.group(1))
-    return deps
-
-
-def find_python_imports(repo_path: Path) -> set[str]:
-    """Find all Python import statements in the repository."""
-    imports: set[str] = set()
-    for root, dirs, files in os.walk(repo_path):
-        dirs[:] = [d for d in dirs if not should_skip_dir(d)]
-        for fname in files:
-            if not fname.endswith(".py"):
-                continue
-            fpath = Path(root) / fname
-            content = read_file_safe(fpath)
-            if content is None:
-                continue
-            for line in content.splitlines():
-                line = line.strip()
-                # import X or import X.Y
-                m = re.match(r"^import\s+([a-zA-Z_][a-zA-Z0-9_]*)", line)
-                if m:
-                    imports.add(m.group(1))
-                # from X import ...
-                m = re.match(r"^from\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+import", line)
-                if m:
-                    imports.add(m.group(1))
-    return imports
-
-
-def get_python_version_requirement(content: str) -> str | None:
-    """Extract requires-python from pyproject.toml."""
-    m = re.search(r'requires-python\s*=\s*["\']([^"\']+)["\']', content)
-    return m.group(1) if m else None
-
-
-def get_git_info(repo_path: Path) -> dict[str, str]:
-    """Get Git repository information."""
-    info: dict[str, str] = {"commit": "", "branch": "", "remotes": ""}
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(repo_path), capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0:
-            info["commit"] = result.stdout.strip()
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=str(repo_path), capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0:
-            info["branch"] = result.stdout.strip()
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
-    return info
-
-
-# Well-known mapping from PyPI package name to import name
-PACKAGE_IMPORT_MAP: dict[str, list[str]] = {
-    "pillow": ["PIL"],
-    "pyyaml": ["yaml"],
-    "scikit-learn": ["sklearn"],
-    "python-dateutil": ["dateutil"],
-    "beautifulsoup4": ["bs4"],
-    "opencv-python": ["cv2"],
-    "opencv-python-headless": ["cv2"],
-    "python-dotenv": ["dotenv"],
-    "attrs": ["attr"],
-    "pymongo": ["pymongo", "bson", "gridfs"],
-    "protobuf": ["google.protobuf"],
-    "google-auth": ["google.auth"],
-    "setuptools": ["setuptools", "pkg_resources"],
-}
-
-
-def get_import_names(package_name: str) -> list[str]:
-    """Get possible import names for a PyPI package."""
-    lower = package_name.lower().replace("-", "_")
-    if lower in PACKAGE_IMPORT_MAP:
-        return PACKAGE_IMPORT_MAP[lower]
-    if package_name.lower() in PACKAGE_IMPORT_MAP:
-        return PACKAGE_IMPORT_MAP[package_name.lower()]
-    return [lower]
-
-
-def inspect_repository(repo_path: Path) -> dict[str, Any]:
-    """Perform full deterministic inspection of a repository.
-    
-    Returns a dict with manifests, dependencies, imports, git info, and findings.
+def inspect_repository(repo_path: str) -> InspectionResult:
     """
-    repo_path = Path(repo_path)
-    if not repo_path.is_dir():
-        return {"error": f"Repository path does not exist: {repo_path}", "findings": []}
+    Deterministically inspect a Python repository.
 
-    result: dict[str, Any] = {
-        "repo_path": str(repo_path),
-        "manifests": {},
-        "declared_deps": [],
-        "imports_found": [],
-        "git_info": {},
-        "python_requires": None,
-        "findings": [],
-        "errors": [],
-    }
+    Parameters
+    ----------
+    repo_path : str
+        Absolute or relative path to the repository root.
 
-    # Find manifests
-    manifests = find_manifest_files(repo_path)
-    result["manifests"] = {k: str(v) for k, v in manifests.items()}
+    Returns
+    -------
+    InspectionResult
+        All observed facts. Never raises.
+    """
+    root = Path(repo_path).resolve()
+    result = InspectionResult(repo_path=str(root))
 
-    # Parse dependencies from manifests
-    all_declared_deps: list[str] = []
-    dep_sources: dict[str, str] = {}  # dep -> source file
-
-    for label, fpath in manifests.items():
-        content = read_file_safe(fpath)
-        if content is None:
-            result["errors"].append(f"Could not read {label}")
-            continue
-
-        deps: list[str] = []
-        if label == "requirements.txt" or label == "requirements-dev.txt":
-            deps = parse_requirements_txt(content)
-        elif label == "setup.cfg":
-            deps = parse_setup_cfg_deps(content)
-        elif label == "pyproject.toml":
-            deps = parse_pyproject_deps(content)
-            result["python_requires"] = get_python_version_requirement(content)
-
-        for d in deps:
-            all_declared_deps.append(d)
-            dep_sources[d] = label
-
-    result["declared_deps"] = list(set(all_declared_deps))
-
-    # Find imports
-    imports = find_python_imports(repo_path)
-    result["imports_found"] = sorted(imports)
+    if not root.exists():
+        result.errors.append(f"Repository path does not exist: {root}")
+        return result
+    if not root.is_dir():
+        result.errors.append(f"Repository path is not a directory: {root}")
+        return result
 
     # Git info
-    result["git_info"] = get_git_info(repo_path)
+    result.repo_commit, result.repo_branch = _git_info(root)
 
-    # Analyze: find potentially unused declared dependencies
-    for dep in all_declared_deps:
-        import_names = get_import_names(dep)
-        used = any(iname in imports for iname in import_names)
-        if not used:
-            source_file = dep_sources.get(dep, "unknown")
-            source_path = manifests.get(source_file)
-            evidence_refs = []
-            if source_path:
-                content = read_file_safe(source_path)
-                if content:
-                    for i, line in enumerate(content.splitlines(), 1):
-                        if dep.lower() in line.lower():
-                            evidence_refs.append(EvidenceRef(
-                                file_path=str(source_path),
-                                line_start=i,
-                                line_end=i,
-                                snippet=line.strip(),
-                                description=f"Dependency '{dep}' declared in {source_file}",
-                            ))
-                            break
+    # pyproject.toml
+    pp = root / "pyproject.toml"
+    if pp.exists():
+        _parse_pyproject(result, pp)
+    else:
+        result.errors.append("pyproject.toml not found")
 
-            finding = Finding(
-                title=f"Potentially unused dependency: {dep}",
-                description=(
-                    f"The dependency '{dep}' is declared in {source_file} "
-                    f"but no matching import ({', '.join(import_names)}) "
-                    f"was found in .py files. This may be unused, or it may "
-                    f"be used via dynamic import, plugin, CLI tool, or "
-                    f"alternate import name not covered by the scanner."
-                ),
-                classification="dependency-maintenance",
-                severity=Severity.LOW,
-                evidence=evidence_refs,
-                affected_files=[str(source_path)] if source_path else [],
-                expected_outcome=f"Confirm whether '{dep}' is needed; remove if unused.",
-                confidence=0.6,
-                uncertainty=(
-                    f"The package '{dep}' might be imported under a different "
-                    f"name, used as a CLI tool, plugin, or optional runtime "
-                    f"dependency not detectable by static import scanning."
-                ),
-                proposed_action=f"Remove '{dep}' from {source_file} if confirmed unused.",
-                status=Status.OBSERVED,
-                reason="Static import scan did not find matching import.",
-            )
-            result["findings"].append(finding)
+    # requirements.txt
+    req = root / "requirements.txt"
+    if req.exists():
+        result.requirements_path = str(req)
+        result.requirements_deps = _parse_requirements(req)
+        # look for pydantic in requirements
+        text = _read_safe(req)
+        if text:
+            for i, line in enumerate(text.splitlines(), 1):
+                if "pydantic" in line.lower():
+                    result.evidence.append(EvidenceRef(
+                        file_path=str(req),
+                        line_number=i,
+                        excerpt=line.strip(),
+                        status="OBSERVED",
+                    ))
 
-    # Check for stale python version requirements
-    if result.get("python_requires"):
-        py_req = result["python_requires"]
-        if "3.14" in py_req or "3.15" in py_req:
-            result["findings"].append(Finding(
-                title="Python version requirement includes unreleased version",
-                description=f"requires-python = '{py_req}' references unreleased Python versions.",
-                classification="metadata-maintenance",
-                severity=Severity.MEDIUM,
-                confidence=0.9,
-                status=Status.OBSERVED,
-            ))
+    # requirements-dev.txt
+    req_dev = root / "requirements-dev.txt"
+    if req_dev.exists():
+        result.requirements_dev_path = str(req_dev)
+        result.requirements_dev_deps = _parse_requirements(req_dev)
+
+    # .python-version
+    pv = root / ".python-version"
+    if pv.exists():
+        content = _read_safe(pv)
+        result.python_version_file = (content or "").strip()
+
+    # Scan source files for pydantic usage patterns (config.py etc.)
+    _scan_source_for_pydantic_v1(root, result)
 
     return result
+
+
+def _scan_source_for_pydantic_v1(root: Path, result: InspectionResult) -> None:
+    """Look for Pydantic v1-style API usage in Python source files."""
+    v1_patterns = [
+        ("@validator", "Pydantic v1 @validator decorator (removed in v2)"),
+        ("class Config:", "Pydantic v1 inner Config class (removed in v2)"),
+        ("anystr_strip_whitespace", "Pydantic v1 Config option (removed in v2)"),
+        ("from pydantic import validator", "Pydantic v1 import"),
+        ("pydantic.validator", "Pydantic v1 validator import"),
+    ]
+
+    for py_file in root.rglob("*.py"):
+        # skip irrelevant dirs
+        if any(part in SKIP_DIRS for part in py_file.parts):
+            continue
+        text = _read_safe(py_file)
+        if not text:
+            continue
+        for pattern, description in v1_patterns:
+            for i, line in enumerate(text.splitlines(), 1):
+                if pattern in line:
+                    result.evidence.append(EvidenceRef(
+                        file_path=str(py_file),
+                        line_number=i,
+                        excerpt=f"[{description}] {line.strip()}",
+                        status="OBSERVED",
+                    ))

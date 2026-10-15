@@ -1,212 +1,364 @@
-"""Stage F: Capsule generation - JSON and Markdown reports."""
+"""Stage F: Dependency Exit Capsule generation.
+
+Generates both reports/dependency_exit_capsule.json and
+reports/dependency_exit_capsule.md from a single canonical EnigmaCapsule object.
+"""
+
 from __future__ import annotations
 
 import json
+import os
+import platform
+import sys
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
-
-from enigma.models import Capsule
-
-# JSON Schema for capsule validation
-CAPSULE_SCHEMA = {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "type": "object",
-    "required": [
-        "schema_version", "run_id", "timestamp_utc",
-        "overall_status", "project_name",
-    ],
-    "properties": {
-        "schema_version": {"type": "string"},
-        "run_id": {"type": "string"},
-        "timestamp_utc": {"type": "string"},
-        "overall_status": {"type": "string", "enum": ["PASS", "PARTIAL", "FAIL", "BLOCKED"]},
-        "project_name": {"type": "string"},
-        "repository_url": {"type": ["string", "null"]},
-        "initial_commit": {"type": ["string", "null"]},
-        "final_commit": {"type": ["string", "null"]},
-        "branch": {"type": ["string", "null"]},
-        "git_state": {"type": ["string", "null"]},
-        "os_info": {"type": "string"},
-        "python_version": {"type": "string"},
-        "python_312_tested": {"type": "boolean"},
-        "python_313_tested": {"type": "boolean"},
-        "finding": {"type": ["object", "null"]},
-        "model_recommendation": {"type": ["object", "null"]},
-        "changes": {"type": "array"},
-        "human_approval": {"type": "string"},
-        "baseline_checks": {"type": "array"},
-        "post_change_checks": {"type": "array"},
-        "hermes_status": {"type": "string"},
-        "blockers": {"type": "array"},
-        "limitations": {"type": "array"},
-        "recovery_instructions": {"type": "string"},
-        "next_steps": {"type": "array"},
-    },
-    "additionalProperties": False,
-}
+from typing import Optional
 
 
-def validate_capsule_json(data: dict[str, Any]) -> tuple[bool, list[str]]:
-    """Validate capsule data against the JSON schema."""
-    errors: list[str] = []
-    try:
-        import jsonschema
-        jsonschema.validate(instance=data, schema=CAPSULE_SCHEMA)
-        return True, []
-    except ImportError:
-        # Fallback: manual validation of required fields
-        for field in CAPSULE_SCHEMA["required"]:
-            if field not in data:
-                errors.append(f"Missing required field: {field}")
-        if "overall_status" in data:
-            allowed = CAPSULE_SCHEMA["properties"]["overall_status"]["enum"]
-            if data["overall_status"] not in allowed:
-                errors.append(f"Invalid overall_status: {data['overall_status']}")
-        return len(errors) == 0, errors
-    except Exception as e:
-        errors.append(f"Validation error: {type(e).__name__}: {e}")
-        return False, errors
+SCHEMA_VERSION = "1.0.0"
 
 
-def generate_json_capsule(capsule: Capsule, output_path: Path) -> tuple[bool, list[str]]:
-    """Generate the JSON capsule file."""
-    data = capsule.to_dict()
-    capsule.overall_status = capsule.compute_overall_status()
-    data["overall_status"] = capsule.overall_status
+@dataclass
+class EnigmaCapsule:
+    """Canonical in-memory report — single source of truth for both outputs."""
+    run_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    schema_version: str = SCHEMA_VERSION
+    timestamp_utc: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
+    )
+    overall_status: str = "PARTIAL"   # PASS | PARTIAL | FAIL | BLOCKED
 
-    valid, errors = validate_capsule_json(data)
+    # Project identity
+    project_name: str = "linkwatch"
+    project_version: Optional[str] = None
+    repo_url: str = "https://github.com/rishrek/LinkWatch"
+    repo_path: str = ""
+    initial_commit: Optional[str] = None
+    final_commit: Optional[str] = None
+    branch: Optional[str] = None
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-    return valid, errors
-
-
-def generate_markdown_capsule(capsule: Capsule, output_path: Path) -> None:
-    """Generate the Markdown capsule from the same canonical capsule object."""
-    data = capsule.to_dict()
-    lines: list[str] = []
-
-    lines.append("# Enigma Maintenance Capsule")
-    lines.append("")
-    lines.append(f"**Run ID:** `{data['run_id']}`  ")
-    lines.append(f"**Timestamp (UTC):** `{data['timestamp_utc']}`  ")
-    lines.append(f"**Overall Status:** `{data['overall_status']}`  ")
-    lines.append(f"**Schema Version:** `{data['schema_version']}`  ")
-    lines.append("")
-
-    lines.append("## Environment")
-    lines.append(f"- **Project:** {data['project_name']}")
-    lines.append(f"- **Repository:** {data.get('repository_url', 'N/A')}")
-    lines.append(f"- **Branch:** {data.get('branch', 'N/A')}")
-    lines.append(f"- **OS:** {data.get('os_info', 'N/A')}")
-    lines.append(f"- **Python:** {data.get('python_version', 'N/A')}")
-    lines.append(f"- **Python 3.12 tested:** {data.get('python_312_tested', False)}")
-    lines.append(f"- **Python 3.13 tested:** {data.get('python_313_tested', False)}")
-    lines.append(f"- **Initial commit:** `{data.get('initial_commit', 'N/A')}`")
-    lines.append(f"- **Final commit:** `{data.get('final_commit', 'N/A')}`")
-    lines.append("")
+    # Environment
+    os_info: str = field(default_factory=lambda: platform.platform())
+    python_version: str = field(default_factory=lambda: sys.version.split()[0])
+    python_312_tested: bool = False
+    python_313_tested: bool = False
 
     # Finding
-    lines.append("## Finding")
-    finding = data.get("finding")
-    if finding:
-        lines.append(f"- **ID:** `{finding.get('finding_id', 'N/A')}`")
-        lines.append(f"- **Title:** {finding.get('title', 'N/A')}")
-        lines.append(f"- **Description:** {finding.get('description', 'N/A')}")
-        lines.append(f"- **Classification:** {finding.get('classification', 'N/A')}")
-        lines.append(f"- **Severity:** {finding.get('severity', 'N/A')}")
-        lines.append(f"- **Confidence:** {finding.get('confidence', 'N/A')}")
-        lines.append(f"- **Status:** {finding.get('status', 'N/A')}")
-        lines.append(f"- **Uncertainty:** {finding.get('uncertainty', 'N/A')}")
-        lines.append("")
-        if finding.get("evidence"):
-            lines.append("### Evidence")
-            for ev in finding["evidence"]:
-                lines.append(f"- `{ev['file_path']}` (line {ev.get('line_start', '?')}): {ev.get('description', '')}")
-                if ev.get("snippet"):
-                    lines.append(f"  ```")
-                    lines.append(f"  {ev['snippet']}")
-                    lines.append(f"  ```")
-            lines.append("")
-    else:
-        lines.append("No finding recorded.")
-        lines.append("")
+    finding: Optional[dict] = None
 
-    # Model Recommendation
-    lines.append("## Model Recommendation")
-    rec = data.get("model_recommendation")
-    if rec:
-        lines.append(f"- **Model:** {rec.get('model_name', 'N/A')}")
-        lines.append(f"- **Runtime:** {rec.get('model_runtime', 'N/A')}")
-        lines.append(f"- **Inference occurred:** {rec.get('inference_occurred', False)}")
-        lines.append(f"- **Validation:** {rec.get('validation_result', 'N/A')}")
-        if rec.get("recommendation"):
-            lines.append(f"- **Recommendation:** {rec['recommendation']}")
-        if rec.get("error"):
-            lines.append(f"- **Error/Blocker:** {rec['error']}")
-    else:
-        lines.append("No model recommendation recorded.")
-    lines.append("")
+    # Model
+    model_result: Optional[dict] = None
 
-    # Changes
-    lines.append("## Changes")
-    changes = data.get("changes", [])
-    if changes:
-        for ch in changes:
-            lines.append(f"- **File:** `{ch.get('file_path', 'N/A')}`")
-            lines.append(f"  - Type: {ch.get('change_type', 'N/A')}")
-            lines.append(f"  - Approved: {ch.get('approved', False)}")
-            lines.append(f"  - Applied: {ch.get('applied', False)}")
-            lines.append(f"  - Description: {ch.get('description', '')}")
-            lines.append(f"  - Recovery: {ch.get('recovery', '')}")
-    else:
-        lines.append("No changes recorded.")
-    lines.append("")
+    # Review
+    review_result: Optional[dict] = None
 
-    # Checks
-    for section, key in [("Baseline Checks", "baseline_checks"), ("Post-Change Checks", "post_change_checks")]:
-        lines.append(f"## {section}")
-        checks = data.get(key, [])
-        if checks:
-            for ck in checks:
-                cmd = ck.get("command", "N/A")
-                status = ck.get("status", "N/A")
-                exit_code = ck.get("exit_code", "N/A")
-                lines.append(f"- `{cmd}` → **{status}** (exit code: {exit_code})")
-                if ck.get("reason"):
-                    lines.append(f"  - Reason: {ck['reason']}")
-        else:
-            lines.append("No checks recorded.")
-        lines.append("")
+    # Verification
+    baseline_checks: list[dict] = field(default_factory=list)
+    post_change_checks: list[dict] = field(default_factory=list)
 
-    # Integration status
-    lines.append("## Integration Status")
-    lines.append(f"- **Hermes:** {data.get('hermes_status', 'NOT_VERIFIED')}")
-    lines.append(f"- **Human approval:** {data.get('human_approval', 'N/A')}")
-    lines.append("")
+    # Hermes
+    hermes_status: str = "NOT_VERIFIED"
+    hermes_notes: str = "Hermes Agent not installed in this environment."
 
     # Blockers
-    lines.append("## Blockers & Limitations")
-    for b in data.get("blockers", []):
-        lines.append(f"- ⛔ {b}")
-    for l in data.get("limitations", []):
-        lines.append(f"- ⚠️ {l}")
-    if not data.get("blockers") and not data.get("limitations"):
-        lines.append("None.")
-    lines.append("")
+    blockers: list[str] = field(default_factory=list)
+    limitations: list[str] = field(default_factory=list)
 
     # Recovery
-    lines.append("## Recovery Instructions")
-    lines.append(data.get("recovery_instructions", "No recovery needed."))
-    lines.append("")
+    recovery_instructions: list[str] = field(default_factory=list)
+    next_steps: list[str] = field(default_factory=list)
 
-    # Next steps
-    lines.append("## Next Steps")
-    for ns in data.get("next_steps", []):
-        lines.append(f"- {ns}")
-    lines.append("")
+    def compute_overall_status(self) -> str:
+        """Aggregate status from all checks."""
+        if self.finding is None:
+            return "BLOCKED"
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text("\n".join(lines), encoding="utf-8")
+        all_checks = self.baseline_checks + self.post_change_checks
+        statuses = [c.get("status", "SKIPPED") for c in all_checks]
+
+        has_fail = any(s == "FAIL" for s in statuses)
+        has_pass = any(s == "PASS" for s in statuses)
+        has_blocked = bool(self.blockers)
+
+        if has_fail:
+            return "FAIL"
+        if has_blocked and not has_pass:
+            return "BLOCKED"
+        if has_blocked or not self.python_312_tested or not self.python_313_tested:
+            return "PARTIAL"
+        if has_pass:
+            return "PASS"
+        return "PARTIAL"
+
+    def to_dict(self) -> dict:
+        self.overall_status = self.compute_overall_status()
+        return {
+            "schema_version": self.schema_version,
+            "run_id": self.run_id,
+            "timestamp_utc": self.timestamp_utc,
+            "overall_status": self.overall_status,
+            "project": {
+                "name": self.project_name,
+                "version": self.project_version,
+                "repo_url": self.repo_url,
+                "repo_path": self.repo_path,
+                "initial_commit": self.initial_commit,
+                "final_commit": self.final_commit,
+                "branch": self.branch,
+            },
+            "environment": {
+                "os_info": self.os_info,
+                "python_version": self.python_version,
+                "python_312_tested": self.python_312_tested,
+                "python_313_tested": self.python_313_tested,
+            },
+            "finding": self.finding,
+            "model": self.model_result,
+            "review": self.review_result,
+            "verification": {
+                "baseline_checks": self.baseline_checks,
+                "post_change_checks": self.post_change_checks,
+            },
+            "hermes": {
+                "status": self.hermes_status,
+                "notes": self.hermes_notes,
+            },
+            "blockers": self.blockers,
+            "limitations": self.limitations,
+            "recovery_instructions": self.recovery_instructions,
+            "next_steps": self.next_steps,
+        }
+
+
+def _check_status_icon(status: str) -> str:
+    icons = {"PASS": "✅", "FAIL": "❌", "TIMEOUT": "⏱️",
+             "MISSING_EXECUTABLE": "🔍", "SKIPPED": "⏭️", "ERROR": "⚠️",
+             "BLOCKED": "🚫", "PARTIAL": "🟡", "SUCCESS": "✅"}
+    return icons.get(status, "❓")
+
+
+def _render_checks_table(checks: list[dict]) -> str:
+    if not checks:
+        return "_No checks recorded._\n"
+    lines = ["| Label | Command | Status | Exit | Elapsed |",
+             "|-------|---------|--------|------|---------|"]
+    for c in checks:
+        cmd = " ".join(c.get("command", []))[:60]
+        status = c.get("status", "?")
+        icon = _check_status_icon(status)
+        lines.append(
+            f"| {c.get('label','?')} | `{cmd}` | {icon} {status} "
+            f"| {c.get('exit_code','—')} | {c.get('elapsed_seconds','—')}s |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def generate_capsule_files(capsule: EnigmaCapsule, output_dir: str = "reports") -> tuple[str, str]:
+    """
+    Write dependency_exit_capsule.json and dependency_exit_capsule.md.
+
+    Both are generated from the same capsule object.
+    Returns (json_path, md_path).
+    """
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    data = capsule.to_dict()
+
+    json_path = os.path.join(output_dir, "dependency_exit_capsule.json")
+    md_path = os.path.join(output_dir, "dependency_exit_capsule.md")
+
+    # JSON
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+    # Markdown — rendered from the same `data` dict
+    md = _render_markdown(data)
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(md)
+
+    return json_path, md_path
+
+
+def _render_markdown(data: dict) -> str:
+    status = data.get("overall_status", "?")
+    icon = _check_status_icon(status)
+    finding = data.get("finding") or {}
+    model = data.get("model") or {}
+    review = data.get("review") or {}
+    verif = data.get("verification") or {}
+    proj = data.get("project") or {}
+    env = data.get("environment") or {}
+    hermes = data.get("hermes") or {}
+
+    evidence_rows = ""
+    for e in finding.get("evidence", []):
+        evidence_rows += (
+            f"| `{Path(e.get('file_path','?')).name}` "
+            f"| {e.get('line_number','—')} "
+            f"| `{e.get('excerpt','')[:80]}` "
+            f"| {e.get('status','?')} |\n"
+        )
+
+    baseline_table = _render_checks_table(verif.get("baseline_checks", []))
+    post_table = _render_checks_table(verif.get("post_change_checks", []))
+
+    model_section = ""
+    model_label = model.get("label", "NOT_VERIFIED")
+    if model.get("inference_performed"):
+        rec = model.get("validated_recommendation") or {}
+        model_section = f"""
+**Model**: `{model.get('model_id', '?')}` via {model.get('runtime','?')}
+**Label**: `{model_label}`
+**Rationale**: {rec.get('rationale', '—')[:400]}
+**Proposed change**: {rec.get('proposed_change', '—')[:400]}
+**Confidence**: {rec.get('confidence', '—')}
+"""
+    else:
+        model_section = f"""
+**Status**: `{model.get('status', 'BLOCKED')}`  [label: `{model_label}`]
+**Blocker**: {model.get('blocker_reason', 'N/A')}
+
+> ⚠️ No real model inference was performed. Deterministic finding stands independently.
+"""
+
+    changes_section = ""
+    for ch in review.get("changes_applied", []):
+        changes_section += f"\n**File**: `{ch.get('file_path','?')}`\n"
+        changes_section += f"**Description**: {ch.get('description','?')}\n"
+        diff = ch.get("diff_preview", "")
+        if diff:
+            changes_section += f"\n```diff\n{diff}\n```\n"
+        changes_section += f"\n**Recovery**: `{ch.get('recovery_instructions','?')}`\n"
+
+    blockers = data.get("blockers", [])
+    blockers_md = "\n".join(f"- {b}" for b in blockers) if blockers else "_None_"
+    limitations = data.get("limitations", [])
+    limitations_md = "\n".join(f"- {l}" for l in limitations) if limitations else "_None_"
+    next_steps = data.get("next_steps", [])
+    next_steps_md = "\n".join(f"1. {s}" for s in next_steps) if next_steps else "_None_"
+    recovery = data.get("recovery_instructions", [])
+    recovery_md = "\n".join(f"- `{r}`" for r in recovery) if recovery else "_None_"
+
+    return f"""# Enigma — Dependency Exit Capsule
+
+> **Status**: {icon} `{status}`  
+> **Run ID**: `{data.get('run_id','?')}`  
+> **Timestamp**: {data.get('timestamp_utc','?')}  
+> **Schema**: v{data.get('schema_version','?')}
+
+---
+
+## Project
+
+| Field | Value |
+|-------|-------|
+| Name | `{proj.get('name','?')}` |
+| Version | `{proj.get('version','?')}` |
+| Repo URL | {proj.get('repo_url','?')} |
+| Commit (initial) | `{proj.get('initial_commit','?')}` |
+| Commit (final) | `{proj.get('final_commit','?')}` |
+| Branch | `{proj.get('branch','?')}` |
+
+## Environment
+
+| Field | Value |
+|-------|-------|
+| OS | {env.get('os_info','?')} |
+| Python | {env.get('python_version','?')} |
+| Python 3.12 tested | {'✅' if env.get('python_312_tested') else '❌'} |
+| Python 3.13 tested | {'✅' if env.get('python_313_tested') else '❌'} |
+
+---
+
+## Finding  `[OBSERVED]`
+
+**ID**: `{finding.get('finding_id','?')}`  
+**Title**: {finding.get('title','?')}  
+**Classification**: `{finding.get('classification','?')}`  
+**Severity**: `{finding.get('severity','?')}`  
+**Confidence**: {finding.get('confidence', 0):.0%}  
+
+### Description
+{finding.get('description','?')}
+
+### Affected Files
+{chr(10).join(f'- `{f}`' for f in finding.get('affected_files', []))}
+
+### Evidence  `[OBSERVED]`
+
+| File | Line | Excerpt | Status |
+|------|------|---------|--------|
+{evidence_rows if evidence_rows else '| — | — | — | — |'}
+
+### Expected Outcome
+{finding.get('expected_outcome','?')}
+
+### Proposed Action
+{finding.get('proposed_action','?')}
+
+### Uncertainty
+{finding.get('uncertainty','?')}
+
+---
+
+## Model Recommendation  `[{model_label}]`
+
+{model_section}
+
+---
+
+## Review & Changes  `[{review.get('approval_source','?')}]`
+
+| Field | Value |
+|-------|-------|
+| Approved | {'✅ Yes' if review.get('approved') else '❌ No'} |
+| Dry-run | {'Yes' if review.get('dry_run') else 'No'} |
+| Approval source | `{review.get('approval_source','?')}` |
+| Skipped reason | {review.get('skipped_reason') or '—'} |
+
+{changes_section if changes_section else '_No changes applied._'}
+
+---
+
+## Verification
+
+### Baseline (before change)  `[VERIFIED_BY_EXECUTION]`
+
+{baseline_table}
+
+### Post-Change (after change)  `[VERIFIED_BY_EXECUTION]`
+
+{post_table}
+
+---
+
+## Hermes Agent
+
+| Field | Value |
+|-------|-------|
+| Status | `{hermes.get('status','?')}` |
+| Notes | {hermes.get('notes','?')} |
+
+---
+
+## Blockers
+
+{blockers_md}
+
+## Limitations
+
+{limitations_md}
+
+## Recovery Instructions
+
+{recovery_md}
+
+## Next Steps
+
+{next_steps_md}
+
+---
+
+*Generated by Enigma v0.1.0 — Hacktoberfest 2026 Track 2 Maintenance Agent Skill*
+"""
