@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "enigma-maintainer"
+version = "0.1.0"
+description = "Evidence-driven repository maintenance agent skill"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.12,<3.14"
+authors = [{name = "Push-Pull-Pray"}]
+keywords = ["maintenance", "agent", "dependency", "hacktoberfest"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+    "jsonschema>=4.20.0",
+    "packaging>=23.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4.0", "pytest-cov>=4.1.0"]
+model = ["llama-cpp-python>=0.2.0"]
+
+[project.scripts]
+enigma = "enigma.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["enigma*"]
