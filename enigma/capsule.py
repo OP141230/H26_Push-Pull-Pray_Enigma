@@ -110,17 +110,45 @@ def canonical(report):
 
 def markdown(report):
     validate(report)
+    from .presentation import markdown_summary
     payload = canonical(report)
     checksum = hashlib.sha256(payload.encode()).hexdigest()
     lines = ['# ENIGMA — Dependency Exit Capsule', '', '**Overall status: ' + report['status'] + '**',
              '', report['scope'], '', 'JSON SHA-256: `' + checksum + '`', '',
              'The complete canonical data is embedded below; the JSON and Markdown contain identical claims.', '',
-             '## Findings', '']
+             markdown_summary(report), '', '## Findings', '']
     for finding in report['inspection']['findings']:
         lines.extend(['- **' + finding['id'] + ' · OBSERVED**: ' + finding['description'],
                       '  Expected: ' + finding['expected_outcome'], '  Uncertainty: ' + finding['uncertainty']])
     if not report['inspection']['findings']:
         lines.append('No actionable finding established by the implemented rule.')
+    model = report['model']
+    lines.extend(['', '## Gemma recommendation', ''])
+    if model['status'] == 'PASS':
+        rec = model['recommendation']
+        lines.extend(['**AI_RECOMMENDATION — actual local model output, not a verified fix.**', '',
+                      'Model: `' + str(model.get('model')) + '`', '',
+                      '**Summary:** ' + rec['summary'], '',
+                      '**Suggested action:** ' + rec['recommendation'], ''])
+        if 'rationale' in rec:
+            lines.extend(['**Model rationale:** ' + rec['rationale'], '', '**Model-identified risks:**', ''])
+            lines.extend('- ' + item for item in rec['risks'])
+            lines.extend(['', '**Model-proposed verification (not executed by the model):**', ''])
+            lines.extend(str(i) + '. ' + item for i, item in enumerate(rec['verification_steps'], 1))
+        lines.extend(['', '**Cited repository evidence:**', ''])
+        for item in report['inspection']['evidence']:
+            if item['id'] in rec['evidence_refs']:
+                lines.append('- ' + item['id'] + ' — `' + item['path'] + ':' + str(item['line']) + '` — `' + item['text'] + '`')
+        lines.extend(['', 'The finding and executable patch are deterministic Enigma logic. '
+                      'The model independently reviews supplied evidence; its text does not control edits or commands.'])
+    else:
+        lines.append('No model recommendation available: ' + model['status'] + ' — ' + model['reason'])
+    lines.extend(['', '## Deterministic patch for separate review', '',
+                  'This patch is produced by Enigma, not by Gemma. It may differ from the model suggestion. '
+                  'Review both before approving; the apply command only supports this displayed patch.', '',
+                  'Change status: **' + report['change']['status'] + '**', ''])
+    if report['change'].get('proposed_diff'):
+        lines.extend(['````diff', report['change']['proposed_diff'].rstrip(), '````'])
     lines.extend(['', '## Execution', ''])
     for stage in ('baseline', 'post_change'):
         for check in report[stage]:
@@ -133,7 +161,9 @@ def markdown(report):
 
 def write(report, directory):
     validate(report)
+    from .presentation import html_report
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     (directory / 'dependency_exit_capsule.json').write_text(canonical(report), encoding='utf-8', newline='\n')
     (directory / 'dependency_exit_capsule.md').write_text(markdown(report), encoding='utf-8', newline='\n')
+    (directory / 'dependency_exit_capsule.html').write_text(html_report(report), encoding='utf-8', newline='\n')

@@ -97,6 +97,49 @@ class WorkflowTests(unittest.TestCase):
         with patch('enigma.model.request', return_value=[]):
             self.assertEqual(recommend(inspection, 'gemma3:1b')['status'], 'BLOCKED')
 
+    def test_structured_model_generation_and_incomplete_responses(self):
+        inspection = self.inspect()
+        finding = inspection['findings'][0]
+        value = {'finding_id': finding['id'], 'summary': 'Fixture observation',
+                 'recommendation': 'Review the conflict', 'evidence_refs': finding['evidence_refs'],
+                 'rationale': 'The fixture declarations disagree.', 'risks': ['Compatibility is untested.'],
+                 'verification_steps': ['Run the fixture tests after approval.']}
+        tags = {'models': [{'name': 'gemma4:latest'}]}
+        response = {'model': 'gemma4:latest', 'done': True, 'done_reason': 'stop', 'response': json.dumps(value)}
+        with patch('enigma.model.request', side_effect=[tags, response]) as request:
+            result = recommend(inspection, 'gemma4:latest')
+            self.assertEqual(result['status'], 'PASS')
+            payload = request.call_args.args[1]
+            self.assertIs(payload['think'], False)
+            self.assertEqual(payload['format']['properties']['finding_id']['enum'], [finding['id']])
+        for content, reason, expected in [('', 'length', 'token limit'), ('', 'stop', 'no final'),
+                                          ('not json', 'stop', 'not valid')]:
+            with patch('enigma.model.request', side_effect=[tags, {**response, 'response': content, 'done_reason': reason}]):
+                result = recommend(inspection, 'gemma4:latest')
+                self.assertEqual(result['status'], 'BLOCKED')
+                self.assertIsNone(result['recommendation'])
+                self.assertIn(expected, result['reason'])
+
+    def test_detailed_recommendation_validation_and_rendering(self):
+        report = self.report()
+        finding = report['inspection']['findings'][0]
+        value = {'finding_id': finding['id'], 'summary': 'Distinct model summary',
+                 'recommendation': 'Distinct model action', 'evidence_refs': finding['evidence_refs'],
+                 'rationale': 'Distinct model rationale', 'risks': ['Distinct model risk'],
+                 'verification_steps': ['Distinct future check']}
+        validate_recommendation(value, finding, report['inspection']['evidence'], require_details=True)
+        for bad in ({**value, 'risks': []}, {**value, 'risks': ['3', '4']}, {**value, 'rationale': 2},
+                    {**value, 'verification_steps': ['x' * 601]}):
+            with self.assertRaises(ValueError):
+                validate_recommendation(bad, finding, report['inspection']['evidence'], require_details=True)
+        report['model'].update(status='PASS', label='AI_RECOMMENDATION', model='fixture-model', recommendation=value)
+        report['status'] = capsule.aggregate(report)
+        rendered = capsule.markdown(report).split('## Canonical report')[0]
+        for text in ('Distinct model summary', 'Distinct model action', 'Distinct model rationale',
+                     'Distinct model risk', 'Distinct future check', 'pyproject.toml:'):
+            self.assertIn(text, rendered)
+        self.assertIn('not executed by the model', rendered)
+
     def test_approval_staleness_backup_and_noop(self):
         finding = self.inspect()['findings'][0]
         original = self.manifest.read_bytes()
@@ -205,6 +248,15 @@ class WorkflowTests(unittest.TestCase):
     def test_reports_cannot_mutate_target(self):
         with self.assertRaises(ValueError):
             workflow(self.repo, self.repo / 'reports')
+
+    def test_cli_forwards_configurable_model_timeout(self):
+        with patch('enigma.cli.workflow', return_value=self.report()) as run:
+            main(['run', str(self.repo), '--output', str(self.out), '--model', 'gemma4:latest', '--model-timeout', '300'])
+            self.assertEqual(run.call_args.kwargs['model_timeout'], 300)
+        with patch('enigma.model.request', side_effect=TimeoutError('fixture timeout')):
+            result = recommend(self.inspect(), 'gemma4:latest', timeout=300)
+            self.assertEqual(result['timeout_seconds'], 300)
+            self.assertEqual(result['status'], 'BLOCKED')
 
     def test_real_approved_fixture_end_to_end(self):
         # Disposable fixture, never represented as the real LinkWatch run.

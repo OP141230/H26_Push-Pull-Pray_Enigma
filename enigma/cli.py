@@ -10,6 +10,7 @@ from .evidence import inspect_repository, redact
 from .maintenance import apply, proposal
 from .model import recommend
 from .runner import run_command
+from .presentation import console, html_report
 
 
 def provenance(root):
@@ -44,7 +45,7 @@ def verify(root, interpreter, temp_root):
     return [check]
 
 
-def workflow(root, output, interpreter=None, model=None, approval=None, expected_hash=None, do_apply=False):
+def workflow(root, output, interpreter=None, model=None, approval=None, expected_hash=None, do_apply=False, model_timeout=180):
     root, output = Path(root).resolve(), Path(output).resolve()
     if output.is_relative_to(root) or root.is_relative_to(output):
         raise ValueError('Reports must be outside and separate from the target repository')
@@ -52,7 +53,7 @@ def workflow(root, output, interpreter=None, model=None, approval=None, expected
     repo = provenance(root) if root.is_dir() else {'path': redact(root), 'branch': None, 'commit': None,
                                                    'initial_status': None, 'final_status': None, 'remotes': None}
     baseline = verify(root, interpreter, output.parent / 'work') if root.is_dir() else []
-    model_result = recommend(inspection, model)
+    model_result = recommend(inspection, model, timeout=model_timeout)
     hermes_exe = shutil.which('hermes')
     hermes = {'status': 'BLOCKED', 'reason': 'Hermes executable not found; discovery and invocation unavailable'}
     if hermes_exe:
@@ -109,33 +110,47 @@ def main(argv=None):
     run.add_argument('--output', type=Path, default=Path('reports'))
     run.add_argument('--check-python', help='Interpreter for trusted repository pytest checks')
     run.add_argument('--model', help='Already installed local Gemma tag, e.g. gemma3:1b')
+    run.add_argument('--model-timeout', type=int, default=180, help='Local inference timeout in seconds (1..900; default 180)')
     run.add_argument('--apply', action='store_true')
     run.add_argument('--approve', help='Exact reviewed finding ID; supply only after explicit human approval')
     run.add_argument('--expected-sha256', help='Hash from the previously reviewed capsule')
     check = commands.add_parser('validate', help='Validate capsule structure, references, statuses and Markdown consistency')
     check.add_argument('capsule', type=Path)
     check.add_argument('--markdown', type=Path)
+    check.add_argument('--html', type=Path)
+    show = commands.add_parser('show', help='Present and render a saved capsule without rerunning tests, inference or edits')
+    show.add_argument('capsule', type=Path)
+    show.add_argument('--output', type=Path, help='Regenerate JSON, Markdown and HTML in this directory')
     args = parser.parse_args(argv)
     try:
+        if args.command == 'show':
+            report = json.loads(args.capsule.read_text(encoding='utf-8'))
+            capsule.validate(report)
+            if args.output:
+                capsule.write(report, args.output)
+            print('Saved run only; no checks, inference or edits performed.\n')
+            print(console(report))
+            return 0
         if args.command == 'validate':
             report = json.loads(args.capsule.read_text(encoding='utf-8'))
             capsule.validate(report)
             if args.markdown and args.markdown.read_text(encoding='utf-8') != capsule.markdown(report):
                 raise ValueError('Markdown differs from canonical data')
+            if args.html and args.html.read_text(encoding='utf-8') != html_report(report):
+                raise ValueError('HTML differs from canonical data')
             print('VERIFIED_BY_EXECUTION: capsule validation passed')
             return 0
         if (args.approve or args.expected_sha256) and not args.apply:
             parser.error('--approve and --expected-sha256 require --apply')
         if args.apply and (not args.approve or not args.expected_sha256 or not args.check_python):
             parser.error('--apply requires --approve, --expected-sha256 and --check-python')
+        if not 1 <= args.model_timeout <= 900:
+            parser.error('--model-timeout must be between 1 and 900 seconds')
         report = workflow(args.repository, args.output, args.check_python, args.model, args.approve,
-                          args.expected_sha256, args.apply)
-        print('ENIGMA: ' + report['status'])
-        for f in report['inspection']['findings']:
-            print(f['label'] + ': ' + f['id'] + ' — ' + f['description'])
-        print('Model: ' + report['model']['status'] + ' — ' + report['model']['reason'])
-        print('Change: ' + report['change']['status'])
-        print('Capsules: ' + str(args.output.resolve()))
+                          args.expected_sha256, args.apply, model_timeout=args.model_timeout)
+        print(console(report))
+        print('Presentation: ' + str(args.output.resolve() / 'dependency_exit_capsule.html'))
+        print('JSON and Markdown: ' + str(args.output.resolve()))
         return 1 if report['status'] == 'FAIL' else 2 if report['status'] == 'BLOCKED' else 0
     except (OSError, ValueError, TypeError, KeyError) as exc:
         print('BLOCKED: ' + redact(exc), file=sys.stderr)
